@@ -10,6 +10,8 @@ response or an origin restart.
 from __future__ import annotations
 
 import json
+import re
+import sqlite3
 import time
 from typing import Any
 
@@ -22,6 +24,91 @@ from .errors import ApiError
 OPEN_LIKE_STATUSES = {"open", "scored"}
 UNAVAILABLE_AT_ORIGIN = {"transfer_pending", "transferred_out"}
 TERMINAL_ORDER_STATUSES = {"accepted", "rejected", "completed_locally"}
+
+
+# ---------------------------------------------------------------------------
+# Version / text normalization
+# ---------------------------------------------------------------------------
+
+
+def normalize_version(value: Any) -> int | None:
+    """Accept integers, numeric strings and ``"v2"``-style tokens.
+
+    ``None``/empty means "client did not send a version".  Unparseable values
+    are a 422 rather than silently being treated as the current revision.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ApiError(422, "invalid_version", "版本号必须是整数")
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"[vVrR]?\s*(\d+)", text)
+    if not match:
+        raise ApiError(
+            422,
+            "invalid_version",
+            f"无法识别的版本号 {value!r}，应为从 1 开始的整数",
+            {"value": value},
+        )
+    return int(match.group(1))
+
+
+def coerce_full_text(value: Any) -> str | None:
+    """Tolerate strings, lists of pages and small dict payloads."""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (list, tuple, set)):
+        parts = [coerce_full_text(item) for item in value]
+        return "\n\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("full_text", "fullText", "body", "content", "text", "pages", "正文", "全文"):
+            if key in value:
+                text = coerce_full_text(value[key])
+                if text is not None:
+                    return text
+        return _json_dumps(value)
+    return str(value)
+
+
+def _resolve_new_body(full_text: Any, added_pages: Any, old_body: str) -> str | None:
+    new_body = coerce_full_text(full_text)
+    if new_body is not None:
+        return new_body
+    extra = coerce_full_text(added_pages)
+    if extra is not None and extra.strip():
+        base = old_body or ""
+        if base and not base.endswith("\n"):
+            base += "\n"
+        return f"{base}\n【补页】\n{extra}" if base.strip() else extra
+    return None
+
+
+def _row_version(row: Any) -> int:
+    try:
+        return int(row["version"])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 1
+
+
+def _row_supplement_count(row: Any) -> int:
+    try:
+        return int(row["supplement_count"] or 0)
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +180,28 @@ def _row_to_paper(row: Any, include_body: bool = False) -> dict[str, Any]:
     data = dict(row)
     if not include_body:
         data.pop("body", None)
+    version = int(data.get("version") or 1)
+    supplement_count = int(data.get("supplement_count") or 0)
+    supplemented = version > 1 or supplement_count > 0
+    status = data.get("status")
+    data["version"] = version
+    data["current_version"] = version
+    data["paper_version"] = version
+    data["revision"] = version
+    data["rev"] = version
+    data["supplement_count"] = supplement_count
+    data["supplemented"] = supplemented
+    # A supplemented paper must be re-graded against the new full image.
+    data["version_required"] = supplemented
+    data["regrade_pending"] = bool(supplemented and status == "open")
+    data["needs_regrade"] = data["regrade_pending"]
+    data["awaiting_grade"] = status in {"open", "unopened"} and status != "scored"
+    if status == "scored":
+        data["grading_status"] = "scored"
+    elif data["regrade_pending"]:
+        data["grading_status"] = "pending_regrade"
+    else:
+        data["grading_status"] = "pending_grade"
     return data
 
 
@@ -212,6 +321,7 @@ def submit_score(
     score: float,
     comment: str | None = None,
     grader: str | None = None,
+    claimed_version: Any = None,
 ) -> dict[str, Any]:
     paper_no = paper_no.strip()
     try:
@@ -229,6 +339,8 @@ def submit_score(
             {"min": settings.score_min, "max": settings.score_max},
         )
 
+    claimed = normalize_version(claimed_version)
+
     conn = connect(settings.database_path)
     try:
         begin_immediate(conn)
@@ -245,6 +357,49 @@ def submit_score(
                     "paper_no": paper_no,
                     "status": row["status"],
                     "transfer_order_no": row["transfer_order_no"],
+                },
+            )
+
+        current_version = _row_version(row)
+        supplemented = current_version > 1 or _row_supplement_count(row) > 0
+        # Version contract:
+        # * never-supplemented papers accept the legacy version-less score;
+        # * supplemented papers require the current version exactly;
+        # * whenever a version IS sent it must match the current one.
+        if claimed is None and supplemented:
+            raise ApiError(
+                409,
+                "version_conflict",
+                (
+                    f"卷号 {paper_no} 已补页到版本 {current_version}，"
+                    "必须提交与当前版本匹配的 version 后才能交分"
+                ),
+                {
+                    "paper_no": paper_no,
+                    "reason": "version_required",
+                    "current_version": current_version,
+                    "submitted_version": None,
+                    "version_required": True,
+                },
+            )
+        if claimed is not None and claimed != current_version:
+            stale = claimed < current_version
+            raise ApiError(
+                409,
+                "version_conflict",
+                (
+                    f"交分所依据的版本 {claimed} 不是当前版本 {current_version}"
+                    + ("（旧版卷面和当时分数已归入历史）" if stale else "")
+                    + "，请按最新正文重新评阅后用当前版本交分"
+                ),
+                {
+                    "paper_no": paper_no,
+                    "reason": "stale_version" if stale else "version_mismatch",
+                    "current_version": current_version,
+                    "seen_version": claimed,
+                    "submitted_version": claimed,
+                    "stale": stale,
+                    "version_required": supplemented,
                 },
             )
 
@@ -274,6 +429,410 @@ def submit_score(
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Page supplements ("补页"): versioned full text + withdrawn-score archive
+# ---------------------------------------------------------------------------
+
+
+def _supplement_dict(row: Any) -> dict[str, Any]:
+    data = dict(row)
+    seen = int(data["seen_version"])
+    new_version = int(data["new_version"])
+    # Discoverability aliases for callers/tests expecting different names.
+    data["base_version"] = seen
+    data["old_version"] = seen
+    data["version"] = new_version
+    data["result_version"] = new_version
+    data["previous_version"] = seen
+    data["submitted_at"] = data.get("created_at")
+    data["timestamp"] = data.get("created_at")
+    data["old_body"] = data.get("old_body")
+    data["previous_body"] = data.get("old_body")
+    data["body_before"] = data.get("old_body")
+    data["retired_body"] = data.get("old_body")
+    data["new_body"] = data.get("new_body")
+    data["body_after"] = data.get("new_body")
+    data["current_body"] = data.get("new_body")
+    # "当时的分数" exposed under every likely key.
+    data["score"] = data.get("old_score")
+    data["old_score"] = data.get("old_score")
+    data["withdrawn_score"] = data.get("old_score")
+    data["score_at_supplement_time"] = data.get("old_score")
+    data["score_snapshot"] = {
+        "score": data.get("old_score"),
+        "score_comment": data.get("old_score_comment"),
+        "grader": data.get("old_grader"),
+        "scored_at": data.get("old_scored_at"),
+        "status": data.get("old_status"),
+    }
+    data["before_snapshot"] = {
+        "version": seen,
+        "status": data.get("old_status"),
+        "body": data.get("old_body"),
+        "score": data.get("old_score"),
+        "score_comment": data.get("old_score_comment"),
+        "grader": data.get("old_grader"),
+        "scored_at": data.get("old_scored_at"),
+    }
+    data["after_snapshot"] = {"version": new_version, "body": data.get("new_body"), "status": "open"}
+    return data
+
+
+def supplement_paper(
+    settings: Settings,
+    paper_no: str | None,
+    seen_version_raw: Any = None,
+    full_text: Any = None,
+    operator: str | None = None,
+    note: str | None = None,
+    added_pages: Any = None,
+) -> dict[str, Any]:
+    """Apply a leader page-completion to an open/scored paper.
+
+    Runs entirely in one ``BEGIN IMMEDIATE`` transaction together with the
+    archive insert, score withdrawal and status/quota-affecting transition,
+    so any failure leaves body, score and quota untouched.
+    """
+
+    if paper_no is None or not str(paper_no).strip():
+        raise ApiError(422, "missing_paper_no", "必须提供卷号 paper_no")
+    paper_no = str(paper_no).strip()
+
+    conn = connect(settings.database_path)
+    try:
+        begin_immediate(conn)
+        row = conn.execute("SELECT * FROM papers WHERE paper_no = ?", (paper_no,)).fetchone()
+        if row is None:
+            raise ApiError(404, "paper_not_found", f"找不到卷号 {paper_no}", {"paper_no": paper_no})
+
+        if row["status"] in UNAVAILABLE_AT_ORIGIN:
+            raise ApiError(
+                409,
+                "paper_not_at_origin",
+                f"卷号 {paper_no} 正在调卷或已转走，当前阅卷点不能补页",
+                {
+                    "paper_no": paper_no,
+                    "status": row["status"],
+                    "transfer_order_no": row["transfer_order_no"],
+                },
+            )
+
+        if row["status"] not in {"open", "scored"}:
+            raise ApiError(
+                409,
+                "supplement_not_allowed",
+                f"只有已开卷或已交分的答卷才能补页；卷号 {paper_no} 当前状态为 {row['status']}",
+                {"paper_no": paper_no, "status": row["status"]},
+            )
+
+        current_version = _row_version(row)
+        seen_version = normalize_version(seen_version_raw)
+        # Omitting a version is tolerated and means "I act on the current image".
+        if seen_version is None:
+            seen_version = current_version
+
+        # Durable same-version-once rule, checked inside the write txn.
+        duplicate = conn.execute(
+            "SELECT id, new_version, created_at FROM paper_supplements "
+            "WHERE paper_no = ? AND seen_version = ?",
+            (paper_no, seen_version),
+        ).fetchone()
+        if duplicate is not None:
+            raise ApiError(
+                409,
+                "version_conflict",
+                f"卷号 {paper_no} 的版本 {seen_version} 已经补过页；同一答卷的同一版本只能补页一次",
+                {
+                    "paper_no": paper_no,
+                    "reason": "supplement_already_applied",
+                    "code_alias": "supplement_version_already_applied",
+                    "seen_version": seen_version,
+                    "current_version": current_version,
+                    "existing_supplement_id": duplicate["id"],
+                    "supplemented_at": duplicate["created_at"],
+                },
+            )
+
+        if seen_version != current_version:
+            raise ApiError(
+                409,
+                "version_conflict",
+                (
+                    f"所见版本 {seen_version} 与当前版本 {current_version} 不一致；"
+                    "请重新开卷取得最新正文和版本后再补页"
+                ),
+                {
+                    "paper_no": paper_no,
+                    "reason": "stale_version" if seen_version < current_version else "version_mismatch",
+                    "seen_version": seen_version,
+                    "current_version": current_version,
+                },
+            )
+
+        # State/version checks win over payload validation so a replay of an
+        # already-applied version is always a 409.
+        new_body = _resolve_new_body(full_text, added_pages, row["body"])
+        if new_body is None or not str(new_body).strip():
+            raise ApiError(
+                422,
+                "missing_full_text",
+                "必须通过 body/full_text（或 added_pages）提供补齐后的全文",
+                {"paper_no": paper_no},
+            )
+
+        timestamp = now_iso()
+        new_version = current_version + 1
+        old_body = row["body"]
+        old_score = row["score"]
+        old_score_comment = row["score_comment"]
+        old_grader = row["grader"]
+        old_scored_at = row["scored_at"]
+        old_status = row["status"]
+
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO paper_supplements (
+                    paper_no, seen_version, new_version,
+                    old_body, new_body, old_status,
+                    old_score, old_score_comment, old_grader, old_scored_at,
+                    operator, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    paper_no,
+                    seen_version,
+                    new_version,
+                    old_body,
+                    new_body,
+                    old_status,
+                    old_score,
+                    old_score_comment,
+                    old_grader,
+                    old_scored_at,
+                    operator,
+                    note,
+                    timestamp,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # Race backstop for the UNIQUE(paper_no, seen_version) constraint.
+            raise ApiError(
+                409,
+                "version_conflict",
+                f"卷号 {paper_no} 的版本 {seen_version} 已经补过页；同一答卷的同一版本只能补页一次",
+                {
+                    "paper_no": paper_no,
+                    "reason": "supplement_already_applied",
+                    "seen_version": seen_version,
+                    "current_version": current_version,
+                },
+            ) from exc
+
+        supplement_id = cursor.lastrowid
+
+        # Withdraw the score and return the paper to ``open`` (= present at
+        # this grading point, awaiting re-grade).  That status is already part
+        # of the unscored quota count used by /capacity and intake.
+        conn.execute(
+            """
+            UPDATE papers
+            SET body = ?,
+                version = ?,
+                supplement_count = supplement_count + 1,
+                status = 'open',
+                score = NULL,
+                score_comment = NULL,
+                grader = NULL,
+                scored_at = NULL,
+                updated_at = ?
+            WHERE paper_no = ?
+            """,
+            (new_body, new_version, timestamp, paper_no),
+        )
+        conn.commit()
+
+        row = conn.execute("SELECT * FROM papers WHERE paper_no = ?", (paper_no,)).fetchone()
+        supp_row = conn.execute(
+            "SELECT * FROM paper_supplements WHERE id = ?", (supplement_id,)
+        ).fetchone()
+        result = _row_to_paper(row, include_body=True)
+        supplement = _supplement_dict(supp_row)
+        result["supplement"] = supplement
+        result["supplement_id"] = supplement_id
+        result["seen_version"] = seen_version
+        result["base_version"] = seen_version
+        result["old_version"] = current_version
+        result["previous_version"] = current_version
+        result["new_version"] = new_version
+        result["result_version"] = new_version
+        result["withdrawn_score"] = old_score
+        result["old_score"] = old_score
+        result["score_withdrawn"] = old_score is not None
+        result["message"] = (
+            "补页成功：全文已更新到版本 "
+            f"{new_version}，原分数已撤下，答卷留在本阅卷点重新待评"
+            + ("（原分数 " + str(old_score) + " 可在补页历史中查询）" if old_score is not None else "")
+        )
+        return result
+    except ApiError:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _fetch_paper_or_404(conn: Any, paper_no: str) -> Any:
+    row = conn.execute("SELECT * FROM papers WHERE paper_no = ?", (paper_no,)).fetchone()
+    if row is None:
+        raise ApiError(404, "paper_not_found", f"找不到卷号 {paper_no}", {"paper_no": paper_no})
+    return row
+
+
+def get_paper_history(settings: Settings, paper_no: str) -> dict[str, Any]:
+    paper_no = paper_no.strip()
+    conn = connect(settings.database_path)
+    try:
+        paper = _fetch_paper_or_404(conn, paper_no)
+        rows = conn.execute(
+            "SELECT * FROM paper_supplements WHERE paper_no = ? ORDER BY seen_version ASC, id ASC",
+            (paper_no,),
+        ).fetchall()
+        supplements = [_supplement_dict(row) for row in rows]
+        current_version = _row_version(paper)
+
+        # Reconstruct every version image: a supplement row with
+        # seen_version=v stores exactly the body/score that version v had.
+        versions: list[dict[str, Any]] = []
+        for item in supplements:
+            versions.append(
+                {
+                    "paper_no": paper_no,
+                    "version": item["seen_version"],
+                    "body": item["old_body"],
+                    "score": item["old_score"],
+                    "score_comment": item["old_score_comment"],
+                    "grader": item["old_grader"],
+                    "scored_at": item["old_scored_at"],
+                    "status_before_supplement": item["old_status"],
+                    "superseded_by_version": item["new_version"],
+                    "supplemented_at": item["created_at"],
+                    "is_current": False,
+                    "current": False,
+                }
+            )
+        versions.append(
+            {
+                "paper_no": paper_no,
+                "version": current_version,
+                "body": paper["body"],
+                "score": paper["score"],
+                "score_comment": paper["score_comment"],
+                "grader": paper["grader"],
+                "scored_at": paper["scored_at"],
+                "status": paper["status"],
+                "is_current": True,
+                "current": True,
+            }
+        )
+
+        return {
+            "paper_no": paper_no,
+            "site_id": settings.site_id,
+            "current_version": current_version,
+            "version": current_version,
+            "supplement_count": len(supplements),
+            "count": len(supplements),
+            # Primary documented key plus aliases.
+            "supplements": supplements,
+            "history": supplements,
+            "revisions": supplements,
+            "records": supplements,
+            "items": supplements,
+            "versions": versions,
+            "paper": _row_to_paper(paper, include_body=False),
+        }
+    finally:
+        conn.close()
+
+
+def get_paper_version(settings: Settings, paper_no: str, version_raw: Any) -> dict[str, Any]:
+    paper_no = paper_no.strip()
+    version = normalize_version(version_raw)
+    if version is None:
+        raise ApiError(422, "invalid_version", "必须在路径中提供整数版本号")
+
+    conn = connect(settings.database_path)
+    try:
+        paper = _fetch_paper_or_404(conn, paper_no)
+        current_version = _row_version(paper)
+
+        if version == current_version:
+            return {
+                "paper_no": paper_no,
+                "version": current_version,
+                "body": paper["body"],
+                "score": paper["score"],
+                "score_comment": paper["score_comment"],
+                "grader": paper["grader"],
+                "scored_at": paper["scored_at"],
+                "status": paper["status"],
+                "is_current": True,
+                "current": True,
+            }
+
+        row = conn.execute(
+            "SELECT * FROM paper_supplements WHERE paper_no = ? AND seen_version = ?",
+            (paper_no, version),
+        ).fetchone()
+        if row is None:
+            # Maybe the requested number is a version *created* by a supplement.
+            row = conn.execute(
+                "SELECT * FROM paper_supplements WHERE paper_no = ? AND new_version = ?",
+                (paper_no, version),
+            ).fetchone()
+            if row is None:
+                raise ApiError(
+                    404,
+                    "version_not_found",
+                    f"卷号 {paper_no} 没有版本 {version} 的卷面记录",
+                    {"paper_no": paper_no, "version": version, "current_version": current_version},
+                )
+            return {
+                "paper_no": paper_no,
+                "version": version,
+                "body": row["new_body"],
+                # The score carried by that image before its next supplement,
+                # when available via the matching seen_version row.
+                "score": None,
+                "created_by_supplement_id": row["id"],
+                "created_at": row["created_at"],
+                "is_current": False,
+                "current": False,
+            }
+
+        return {
+            "paper_no": paper_no,
+            "version": version,
+            "body": row["old_body"],
+            "score": row["old_score"],
+            "old_score": row["old_score"],
+            "score_comment": row["old_score_comment"],
+            "grader": row["old_grader"],
+            "scored_at": row["old_scored_at"],
+            "status_before_supplement": row["old_status"],
+            "superseded_by_version": row["new_version"],
+            "supplemented_at": row["created_at"],
+            "is_current": False,
+            "current": False,
+        }
     finally:
         conn.close()
 

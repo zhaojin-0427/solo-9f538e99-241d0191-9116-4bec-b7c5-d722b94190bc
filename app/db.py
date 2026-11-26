@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS papers (
         status IN ('unopened', 'open', 'scored', 'transfer_pending', 'transferred_out')
     ),
     body TEXT NOT NULL,
+    -- Optimistic-concurrency revision.  Every successful page supplement
+    -- increments version by exactly one; rows created by the old schema are
+    -- migrated to version=1.
+    version INTEGER NOT NULL DEFAULT 1,
+    supplement_count INTEGER NOT NULL DEFAULT 0,
     score REAL,
     score_comment TEXT,
     grader TEXT,
@@ -34,6 +39,32 @@ CREATE TABLE IF NOT EXISTS papers (
 CREATE INDEX IF NOT EXISTS idx_papers_status ON papers(status);
 CREATE INDEX IF NOT EXISTS idx_papers_transfer_order
     ON papers(transfer_order_no);
+
+-- One row per successful page-supplement ("补页").  The UNIQUE constraint is
+-- the durable guarantee that the same (paper, seen/base version) can only be
+-- supplemented once.  old_body/old_score_* preserve the retired paper image
+-- and the score that was withdrawn, so both remain queryable forever.
+CREATE TABLE IF NOT EXISTS paper_supplements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_no TEXT NOT NULL,
+    seen_version INTEGER NOT NULL,
+    new_version INTEGER NOT NULL,
+    old_body TEXT NOT NULL,
+    new_body TEXT NOT NULL,
+    old_status TEXT NOT NULL,
+    old_score REAL,
+    old_score_comment TEXT,
+    old_grader TEXT,
+    old_scored_at TEXT,
+    operator TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (paper_no, seen_version),
+    FOREIGN KEY (paper_no) REFERENCES papers(paper_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_supplements_paper
+    ON paper_supplements(paper_no, id);
 
 CREATE TABLE IF NOT EXISTS transfer_orders (
     order_no TEXT PRIMARY KEY,
@@ -187,11 +218,33 @@ def seed_if_empty(conn: sqlite3.Connection, settings: Settings) -> None:
     )
 
 
+def migrate_sqlite(conn: sqlite3.Connection) -> None:
+    """Add post-archive columns to databases created by the initial release.
+
+    The project ships named Docker volumes with real grading data, so startup
+    must upgrade an old file in place instead of recreating it.  SQLite supports
+    ``ADD COLUMN ... NOT NULL DEFAULT ...`` and fills existing rows with the
+    default (version 1 = the original scanned image, never supplemented).
+    """
+
+    paper_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(papers)").fetchall()
+    }
+    if paper_columns:  # table exists; fresh schemas already contain the columns
+        if "version" not in paper_columns:
+            conn.execute("ALTER TABLE papers ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+        if "supplement_count" not in paper_columns:
+            conn.execute(
+                "ALTER TABLE papers ADD COLUMN supplement_count INTEGER NOT NULL DEFAULT 0"
+            )
+
+
 def init_db(settings: Settings) -> None:
     conn = connect(settings.database_path)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        migrate_sqlite(conn)
         seed_if_empty(conn, settings)
     finally:
         conn.close()

@@ -55,6 +55,132 @@ class ScoreRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("grader", "grader_id", "teacher", "阅卷员"),
     )
+    # Optimistic version the grader saw.  Required (and must equal the current
+    # version) once a paper has been supplemented; optional otherwise.
+    version: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "version",
+            "paper_version",
+            "current_version",
+            "scoring_version",
+            "score_version",
+            "seen_version",
+            "base_version",
+            "expected_version",
+            "revision",
+            "rev",
+            "版本",
+            "当前版本",
+            "所见版本",
+        ),
+    )
+
+
+class SupplementRequest(BaseModel):
+    """Leader-only page completion ("补页") request.
+
+    The client reports the version of the paper image it was looking at
+    (optimistic concurrency) and submits the complete post-scan full text.
+    Field aliases intentionally cover the common English/Chinese names.
+    """
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="ignore",
+        json_schema_extra={
+            "example": {
+                "paper_no": "B-001",
+                "seen_version": 1,
+                "body": "补齐漏扫页之后的完整正文……",
+                "operator": "leader-li",
+            }
+        },
+    )
+
+    paper_no: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "paper_no", "paperNo", "paper_id", "paperId", "paper_number",
+            "paperNumber", "id", "卷号",
+        ),
+    )
+    seen_version: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "seen_version",
+            "seenVersion",
+            "seen_revision",
+            "base_version",
+            "baseVersion",
+            "based_on_version",
+            "expected_version",
+            "expectedVersion",
+            "current_version",
+            "paper_version",
+            "from_version",
+            "version",
+            "revision",
+            "rev",
+            "所见版本",
+            "版本",
+        ),
+    )
+    body: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "body",
+            "full_body",
+            "fullBody",
+            "full_text",
+            "fullText",
+            "full_content",
+            "fullContent",
+            "new_full_text",
+            "complete_text",
+            "completed_body",
+            "completedBody",
+            "completed_text",
+            "complete_body",
+            "entire_body",
+            "whole_text",
+            "updated_body",
+            "new_body",
+            "newBody",
+            "answer_body",
+            "answerBody",
+            "content",
+            "text",
+            "全文",
+            "正文",
+            "补齐后全文",
+        ),
+    )
+    # Hedge for callers that send only the newly found pages instead of the
+    # whole completed text.  When body/full_text is present it wins.
+    added_pages: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "added_pages",
+            "addedPages",
+            "new_pages",
+            "pages",
+            "missing_pages",
+            "supplement_pages",
+            "补页内容",
+            "漏扫页",
+        ),
+    )
+    operator: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "operator", "leader", "submitted_by", "submittedBy", "by", "user", "组长", "操作人",
+        ),
+    )
+    note: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("note", "reason", "comment", "remark", "备注", "说明"),
+    )
 
 
 class TransferRequest(BaseModel):
