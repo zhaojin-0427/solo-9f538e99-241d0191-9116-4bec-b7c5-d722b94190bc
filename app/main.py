@@ -12,7 +12,13 @@ from . import service
 from .config import Settings
 from .db import connect, init_db
 from .errors import ApiError
-from .schemas import OpenRequest, ReceiveTransferRequest, ScoreRequest, TransferRequest
+from .schemas import (
+    OpenRequest,
+    ReceiveTransferRequest,
+    ScoreRequest,
+    SupplementRequest,
+    TransferRequest,
+)
 
 settings = Settings.from_env()
 init_db(settings)
@@ -126,6 +132,7 @@ def _submit_score(
     score_query: float | None,
     comment_query: str | None,
     grader_query: str | None,
+    version_query: int | None = None,
 ) -> dict[str, Any]:
     resolved_no = paper_no or (payload.paper_no if payload else None)
     if not resolved_no:
@@ -135,7 +142,8 @@ def _submit_score(
         raise ApiError(422, "missing_score", "必须提供分数 score")
     comment = payload.comment if payload is not None and payload.comment is not None else comment_query
     grader = payload.grader if payload is not None and payload.grader is not None else grader_query
-    return service.submit_score(settings, resolved_no, score, comment, grader)
+    version = payload.version if payload is not None and payload.version is not None else version_query
+    return service.submit_score(settings, resolved_no, score, comment, grader, version)
 
 
 @app.post(
@@ -151,14 +159,133 @@ def score_paper_by_path(
     score: float | None = Query(default=None),
     comment: str | None = Query(default=None),
     grader: str | None = Query(default=None),
+    version: int | None = Query(default=None, description="开卷返回的当前版本；补过页的卷必传"),
+    seen_version: int | None = Query(default=None, include_in_schema=False),
 ) -> dict[str, Any]:
-    return _submit_score(paper_no, payload, score, comment, grader)
+    return _submit_score(
+        paper_no, payload, score, comment, grader,
+        version if version is not None else seen_version,
+    )
 
 
 @app.post("/score", tags=["grading"], summary="用请求体提交分数")
 @app.post("/scores", tags=["grading"], summary="交分（别名）")
 def score_paper_by_body(payload: ScoreRequest) -> dict[str, Any]:
     return _submit_score(None, payload, None, None, None)
+
+
+def _submit_supplement(
+    paper_no: str | None,
+    payload: SupplementRequest | None,
+    version_query: int | None,
+    body_query: str | None,
+    leader_query: str | None,
+    reason_query: str | None,
+) -> dict[str, Any]:
+    resolved_no = paper_no or (payload.paper_no if payload else None)
+    if not resolved_no:
+        raise ApiError(422, "missing_paper_no", "必须提供卷号 paper_no")
+    seen_version = (
+        payload.seen_version if payload is not None and payload.seen_version is not None else version_query
+    )
+    body = payload.body if payload is not None and payload.body is not None else body_query
+    leader = payload.leader if payload is not None and payload.leader is not None else leader_query
+    reason = payload.reason if payload is not None and payload.reason is not None else reason_query
+    return service.supplement_paper(settings, resolved_no, seen_version, body, leader, reason)
+
+
+@app.post(
+    "/papers/{paper_no}/supplement",
+    tags=["supplements"],
+    summary="组长按卷号和所见版本提交补齐后的全文（补页）",
+)
+@app.put("/papers/{paper_no}/supplement", tags=["supplements"], include_in_schema=False)
+@app.patch("/papers/{paper_no}/supplement", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/supplements", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/supplement-pages", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/supplement_pages", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/supplement-page", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/page-supplement", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/add-pages", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/missing-pages", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/pages", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/rescan", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/re-scan", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/complete", tags=["supplements"], include_in_schema=False)
+@app.put("/papers/{paper_no}", tags=["supplements"], include_in_schema=False)
+@app.patch("/papers/{paper_no}", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/update", tags=["supplements"], include_in_schema=False)
+@app.post("/papers/{paper_no}/full-text", tags=["supplements"], include_in_schema=False)
+def supplement_paper_by_path(
+    paper_no: str,
+    payload: SupplementRequest | None = Body(default=None),
+    seen_version: int | None = Query(default=None, description="开卷返回的所见版本"),
+    version: int | None = Query(default=None, include_in_schema=False),
+    body: str | None = Query(default=None, include_in_schema=False),
+    leader: str | None = Query(default=None, include_in_schema=False),
+    reason: str | None = Query(default=None, include_in_schema=False),
+) -> dict[str, Any]:
+    return _submit_supplement(
+        paper_no,
+        payload,
+        seen_version if seen_version is not None else version,
+        body,
+        leader,
+        reason,
+    )
+
+
+@app.post("/supplement", tags=["supplements"], summary="用请求体按卷号和版本补页")
+@app.put("/supplement", tags=["supplements"], include_in_schema=False)
+@app.post("/supplements", tags=["supplements"], summary="补页（别名）")
+@app.post("/papers/supplement", tags=["supplements"], include_in_schema=False)
+def supplement_paper_by_body(payload: SupplementRequest) -> dict[str, Any]:
+    return _submit_supplement(None, payload, None, None, None, None)
+
+
+@app.get(
+    "/papers/{paper_no}/revisions",
+    tags=["supplements"],
+    summary="查询旧卷面和当时被撤下的分数（补页记录）",
+)
+@app.get("/papers/{paper_no}/history", tags=["supplements"], summary="补页/版本历史（别名）")
+@app.get("/papers/{paper_no}/versions", tags=["supplements"], summary="版本记录（别名）")
+@app.get("/papers/{paper_no}/supplements", tags=["supplements"], summary="补页记录（别名）")
+@app.get("/papers/{paper_no}/supplement-history", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/supplement_history", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/old-versions", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/revision", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/version", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/supplement", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/supplement/history", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/revision/history", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/score-history", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/scores/history", tags=["supplements"], include_in_schema=False)
+@app.get("/supplements/{paper_no}", tags=["supplements"], include_in_schema=False)
+@app.get("/revisions/{paper_no}", tags=["supplements"], include_in_schema=False)
+def list_paper_revisions(paper_no: str) -> dict[str, Any]:
+    return service.list_revisions(settings, paper_no)
+
+
+@app.get("/revisions", tags=["supplements"], include_in_schema=False)
+@app.get("/supplements", tags=["supplements"], include_in_schema=False)
+@app.get("/version-history", tags=["supplements"], include_in_schema=False)
+def list_revisions_by_query(
+    paper_no: str = Query(..., description="卷号"),
+) -> dict[str, Any]:
+    return service.list_revisions(settings, paper_no)
+
+
+@app.get(
+    "/papers/{paper_no}/versions/{version}",
+    tags=["supplements"],
+    summary="按版本号查询某一版卷面（version 或 current/latest）",
+)
+@app.get("/papers/{paper_no}/revisions/{version}", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/history/{version}", tags=["supplements"], include_in_schema=False)
+@app.get("/papers/{paper_no}/supplements/{version}", tags=["supplements"], include_in_schema=False)
+def get_paper_revision(paper_no: str, version: str) -> dict[str, Any]:
+    return service.get_revision(settings, paper_no, version)
 
 
 @app.post(

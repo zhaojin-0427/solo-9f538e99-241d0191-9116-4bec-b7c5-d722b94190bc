@@ -127,6 +127,55 @@ GET  http://localhost:8001/internal/transfers/TR-DEMO-001
 POST http://localhost:8001/internal/transfers
 ```
 
+## 2.5 漏扫补页与版本核对
+
+发现答卷漏扫时，组长在任意一个阅卷点的 `/docs`（标签 **supplements**）按卷号和开卷时看到的版本提交补齐后的全文。已 `open` 或 `scored` 的卷都可以补页；未开卷、调卷暂停中或已转出的卷不能补页。
+
+```http
+POST /papers/A-001/supplement
+Content-Type: application/json
+
+{
+  "seen_version": 1,
+  "body": "补齐漏扫页之后的完整正文……",
+  "leader": "leader-zhang",
+  "reason": "第 3 页漏扫"
+}
+```
+
+也支持请求体带卷号：`POST /supplement`，字段别名包括 `version/base_version`、`full_body/full_text/content/全文`、`卷号/所见版本` 等。
+
+补页在同一个 `BEGIN IMMEDIATE` 事务内完成：
+
+1. 把补页前的旧正文、当时的分数/评语/阅卷员/交分时间归档到 `paper_revisions`；
+2. 用补齐全文替换 `papers.body`；
+3. 撤下当前分数（`score/score_comment/grader/scored_at` 置空），状态从 `scored` 退回 `open`，因此卷仍留在当前阅卷点重新待评；
+4. `version` 加一（初始为 1），`supplement_count` 加一。
+
+版本与交分规则：
+
+- 开卷响应（以及 `GET /papers/{no}`）包含 `body` 和 `version` / `current_version`。
+- **补过页的卷**交分必须带与当前版本一致的 `version`（或 `seen_version/expected_version`）；不带版本返回 `409 score_version_required`，带旧版本返回 `409 score_version_conflict`。
+- **未补过页的卷**行为不变，仍接受不带版本的交分；多带的版本字段会被忽略。
+
+旧卷面与当时分数可查：
+
+```http
+GET /papers/A-001/revisions      # 别名 /versions、/history、/supplements
+GET /papers/A-001/versions/1     # 精确查第 1 版；current/latest 指当前版
+GET /papers/A-001                # 详情也内嵌 revisions/history
+```
+
+每条记录的 `body`/`old_body` 是旧卷面，`score`/`old_score`/`withdrawn_score` 是补页时撤下的分数，`new_body` 是补入的全文。
+
+限额与幂等：
+
+- 补页**不检查名额**：已交分卷在名额已满时仍可补页。`scored -> open` 后该卷自动进入“未交分”计数，接收新调卷的 `status NOT IN ('scored','transferred_out')` 限额统计会把这些补页待评卷一并计入。
+- `paper_revisions` 上有 `UNIQUE(paper_no, version)`，配合事务内版本核对，保证同一卷的同一所见版本只能补页一次；重复提交返回 `409 version_already_supplemented`。
+- 任何校验失败都在写入前回滚，卷面、分数和限额计数不变。
+
+旧库升级：服务启动时 `init_db` 会对旧 `papers` 表执行幂等 `ALTER TABLE`（新增 `version DEFAULT 1`、`supplement_count DEFAULT 0`、`last_supplemented_at`），并以 `CREATE TABLE IF NOT EXISTS` 建立 `paper_revisions`，不删除任何现有 SQLite 数据。命名卷 `grading-a-data` / `grading-b-data` 在 `docker compose up --build` 后原地升级。
+
 ## 3. 业务状态和一致性设计
 
 ### 原点状态
@@ -184,7 +233,10 @@ SQLite 使用 `synchronous=FULL`、WAL 和 `busy_timeout`。每个服务只连�
 | 健康检查/限额 | `GET /health`, `GET /capacity` |
 | 列卷/查卷 | `GET /papers`, `GET /papers/{paper_no}` |
 | 开卷取正文 | `POST /papers/{paper_no}/open`, `POST /open` |
-| 交分 | `POST /papers/{paper_no}/score`, `POST /score` |
+| 交分（补页卷需带 `version`） | `POST /papers/{paper_no}/score`, `POST /score` |
+| 补页（按卷号+所见版本提交全文） | `POST /papers/{paper_no}/supplement`, `POST /supplement` |
+| 旧卷面/旧分/版本历史 | `GET /papers/{paper_no}/revisions`（`/versions`、`/history`、`/supplements`） |
+| 按版本查卷面 | `GET /papers/{paper_no}/versions/{version\|current}` |
 | 发起/重试调卷 | `POST /transfers`, `POST /transfer` |
 | 查询调卷单 | `GET /transfers/{order_no}` |
 | 显式重试 | `POST /transfers/{order_no}/retry` |
@@ -207,7 +259,10 @@ pip install -r requirements.txt
 
 python scripts/live_smoke.py
 python scripts/concurrency_check.py
+python scripts/supplement_smoke.py
 ```
+
+`supplement_smoke.py` 用三个真实 uvicorn 进程和独立 SQLite，实测补页后的旧版交分被拒、满额时已交分卷仍可补页、补页待评卷计入接收限额、同版本只能补一次、失败不改卷面/分数/名额，以及“用基线代码建旧库 → 新代码原地迁移并保留数据”。
 
 本次交付前实际运行结果：
 
@@ -243,13 +298,17 @@ RACE_OK: 8 opened-and-kept, 16 transferred; no inconsistent outcome
 
 另外已验证：
 
+- `python scripts/supplement_smoke.py` 全部通过（版本交分、旧卷面/旧分查询、满额补页、限额计入、失败回滚、旧库迁移、重启持久化，共 26 项断言点）；
+- 12 线程并发对同一卷同一版本补页，恰有 1 次成功、其余 11 次返回 `version_already_supplemented`，只生成一条历史；
+- 原 `live_smoke.py`（`LIVE_SMOKE_OK`）与 `concurrency_check.py`（`RACE_OK`）在改动后仍全部通过；
 - `docker-compose.yml` 可被 YAML 解析，包含两个服务和两个独立命名卷；
-- 运行依赖可安装到全新目标目录，FastAPI 应用可导入；
-- `python -m compileall app` 通过。
+- 运行依赖可安装到全新目标目录，FastAPI 应用可导入，`/docs` 与 `/openapi.json` 正常；
+- `python -m compileall app scripts/supplement_smoke.py` 通过。
 
 ## 6. 未完成项与限制
 
-1. **本环境无 Docker 命令/守护进程**，所以没有实际构建镜像或执行 `docker compose up`；Compose 文件和 Dockerfile 是按标准 `python:3.12-slim` + uvicorn 方式编写的，首次在有 Docker 的环境中应再跑一次 `docker compose up --build`。
-2. 未实现阅卷员身份认证/领取锁；需求只要求匿名答卷、开卷取正文和交分，因此当前把“开卷”建模为状态转换，不区分具体阅卷员。
-3. 分数当前允许对同一卷更新（响应中用 `previously_scored` 提示）；如果考试规则要求“一次交分不可改”，可再加约束或复核接口。
-4. 后台对账默认每 3 秒扫描一次 `pending_receiver`；也可随时调用 retry/recover 接口立即对账。
+1. **本环境无 Docker 命令/守护进程**，所以没有实际构建镜像或执行 `docker compose up`；已用真实 uvicorn 进程 + 独立 SQLite（含“基线代码建库 → 新代码迁移”）完成等价实测。Compose/Dockerfile 沿用标准 `python:3.12-slim` + uvicorn，未改服务名、端口和命名卷，首次在有 Docker 的环境中仍应跑一次 `docker compose up --build`；命名卷中的旧 SQLite 会在启动时自动加列/建表并保留数据。
+2. 未实现阅卷员/组长身份认证与权限区分；`leader` 仅作为补页记录的可选署名。任何能访问 `/docs` 的调用方都可补页，与基线“无认证”的设定一致。
+3. 补页后状态复用既有 `open`（已开卷、未交分）表示“重新待评”，没有新增状态值；限额与调卷逻辑因此天然把补页待评卷计入。若上层要求独立的 `regrading` 状态，需要再扩展状态约束与迁移。
+4. 分数当前允许对同一版本重复交分更新（沿用基线的宽松策略，响应含 `previously_scored`）；补页会使版本递增，从而旧版本无法再交分。若考试规则要求“一版一次交分不可改”，可再加唯一约束或复核接口。
+5. 后台对账默认每 3 秒扫描一次 `pending_receiver`；也可随时调用 retry/recover 接口立即对账。

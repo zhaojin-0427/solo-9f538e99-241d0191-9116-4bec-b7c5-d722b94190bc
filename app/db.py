@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS papers (
     grader TEXT,
     source_site TEXT,
     transfer_order_no TEXT,
+    -- Optimistic version of the paper surface.  Every successful page
+    -- supplement archives the current surface and bumps this by one.
+    version INTEGER NOT NULL DEFAULT 1,
+    supplement_count INTEGER NOT NULL DEFAULT 0,
+    last_supplemented_at TEXT,
     opened_at TEXT,
     scored_at TEXT,
     transferred_at TEXT,
@@ -34,6 +39,31 @@ CREATE TABLE IF NOT EXISTS papers (
 CREATE INDEX IF NOT EXISTS idx_papers_status ON papers(status);
 CREATE INDEX IF NOT EXISTS idx_papers_transfer_order
     ON papers(transfer_order_no);
+
+-- One row per successful page supplement: the archived ("old") surface and
+-- the score that was withdrawn at that moment.  UNIQUE(paper_no, version)
+-- is the durable guarantee that one seen version can be supplemented once.
+CREATE TABLE IF NOT EXISTS paper_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    paper_no TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    new_version INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    new_body TEXT,
+    status_before TEXT NOT NULL,
+    score REAL,
+    score_comment TEXT,
+    grader TEXT,
+    scored_at TEXT,
+    supplement_by TEXT,
+    reason TEXT,
+    request_json TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (paper_no, version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_revisions_paper
+    ON paper_revisions(paper_no, version);
 
 CREATE TABLE IF NOT EXISTS transfer_orders (
     order_no TEXT PRIMARY KEY,
@@ -187,11 +217,33 @@ def seed_if_empty(conn: sqlite3.Connection, settings: Settings) -> None:
     )
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add post-baseline columns to databases created by the initial release.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS`` on older versions, so inspect
+    ``PRAGMA table_info`` first.  All changes are additive: existing papers,
+    bodies and scores are left untouched and receive version 1.
+    """
+
+    paper_columns = {row["name"] for row in conn.execute("PRAGMA table_info(papers)").fetchall()}
+    if not paper_columns:
+        # Fresh database: SCHEMA already created the current table.
+        return
+
+    if "version" not in paper_columns:
+        conn.execute("ALTER TABLE papers ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
+    if "supplement_count" not in paper_columns:
+        conn.execute("ALTER TABLE papers ADD COLUMN supplement_count INTEGER NOT NULL DEFAULT 0")
+    if "last_supplemented_at" not in paper_columns:
+        conn.execute("ALTER TABLE papers ADD COLUMN last_supplemented_at TEXT")
+
+
 def init_db(settings: Settings) -> None:
     conn = connect(settings.database_path)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        _migrate(conn)
         seed_if_empty(conn, settings)
     finally:
         conn.close()

@@ -55,6 +55,73 @@ class ScoreRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("grader", "grader_id", "teacher", "阅卷员"),
     )
+    # Required only for papers that have already received a page supplement;
+    # the service enforces that conditional rule against the current version.
+    # Typed as Any so numeric strings are accepted and normalized in service.
+    version: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "version", "expected_version", "expectedVersion",
+            "seen_version", "seenVersion", "body_version", "bodyVersion",
+            "score_version", "版本", "所见版本",
+        ),
+    )
+
+
+class SupplementRequest(BaseModel):
+    """Leader submits the completed full text for a seen version."""
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="ignore",
+        json_schema_extra={
+            "example": {
+                "paper_no": "A-001",
+                "seen_version": 1,
+                "body": "补齐漏扫页后的完整正文……",
+                "leader": "leader-zhang",
+                "reason": "第 3 页漏扫",
+            }
+        },
+    )
+
+    paper_no: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "paper_no", "paperNo", "paper_id", "paperId", "paper_number",
+            "paperNumber", "id", "卷号",
+        ),
+    )
+    seen_version: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "seen_version", "seenVersion", "base_version", "baseVersion",
+            "expected_version", "expectedVersion", "version", "ver",
+            "body_version", "bodyVersion", "所见版本", "版本", "所见版次",
+        ),
+    )
+    body: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "body", "full_body", "fullBody", "full_text", "fullText",
+            "new_body", "newBody", "complete_body", "complete_text",
+            "content", "answer_body", "text", "pages",
+            "全文", "正文", "补齐全文", "补页内容",
+        ),
+    )
+    leader: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "leader", "leader_id", "operator", "operator_id",
+            "supplement_by", "supplemented_by", "by", "组长", "操作人",
+        ),
+    )
+    reason: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "reason", "note", "comment", "remark", "原因", "备注", "说明",
+        ),
+    )
 
 
 class TransferRequest(BaseModel):

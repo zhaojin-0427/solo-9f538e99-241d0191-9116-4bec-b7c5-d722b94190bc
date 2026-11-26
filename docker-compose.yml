@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: grading-transfer-service:1.0.0
+    image: grading-transfer-service:1.1.0-supplement
     container_name: grading-point-a
     environment:
       SITE_ID: point-a
@@ -39,7 +39,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: grading-transfer-service:1.0.0
+    image: grading-transfer-service:1.1.0-supplement
     container_name: grading-point-b
     environment:
       SITE_ID: point-b
